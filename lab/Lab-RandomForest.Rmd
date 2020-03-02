@@ -1,0 +1,356 @@
+---
+title: 'Lab: Random Forests'
+output: 
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    collapse: subsection
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+In this lab, we'll practice fitting, tuning, and testing random forests using the `ranger` package in `R`. 
+The libraries and data that we will use are outlined below.
+The subsequent sections detail a worked example for how to fit a single random forest, as well as how to use cross validation to tune a random forest. 
+Finally, there are three activities for you to try on your own.
+It is recommended that you work through the complete examples, make sure you can run the code and understand what it does, and then try your hand at the activities.
+Note that the code in the worked examples will be useful when you take on the activities.
+
+
+## Libraries
+
+```{r, message = FALSE, warning = FALSE}
+# Wrangling and checking data
+library(tidyverse)
+library(skimr)
+library(janitor)
+
+# Fitting and checking models
+library(ranger) # fit RFs
+library(modelr) # for cross-validation
+library(vip) # variable importance
+library(pdp) # partial dependence
+```
+
+
+## Data
+
+The data we will be working with concerns crime rates in communities.
+Each row in the data corresponds to a US community, and the columns represent different attributes of that community. 
+The outcomes of interest for this lab are the violent and nonviolent crime rates (per 100,000 people).
+
+### Data Dictionary
+
+Note that the name of the community `communityname` is a row identifies and will not be used as a predictor.
+
+Row identifier:
+
+- `communityname`: Name of the community
+
+Potential predictors:
+
+- `state`: State to which community belongs
+- `pct_urban`: % of population living in urban areas
+- `med_income`: Median per capita income
+- `pct_pub_asst`: % of population receiving public assistance (e.g., TANF, SNAP)
+- `med_fam_income`: Median household income
+- `pct_poverty`: % of population earning less than poverty line
+- `pct_not_h_sgrad`: % of adult population without HS education
+- `pct_coll_grad`: % of adult population who are finished at least a bachelor's
+- `pct_unemploy`: % of adult population unemployed
+- `pct_all_divorc`: % of adult population who are divorced
+- `pers_per_fam`: Average number of people per household
+- `pct_kids2par`: % of households with kids where both parents are present
+- `pct_work_mom18`: % of households with kids where the mother works
+- `pct_kids_born_nevr_marr`: % of kids born into households with parents who never marry
+- `pct_immig3`: % of population who are recent immigrants
+- `pct_vacant_boarded`: % of houses that are vacant
+- `own_hous_low_q`: 1st quartile of the value of owner-occupied housing
+- `own_hous_qrange`: IQR of the value of owner-occupied housing
+- `rent_low_q`: 1st quartile of rent
+- `rent_qrange`: IQR of rent
+- `med_rentpct_hous_inc`: Median rent as a percentage of median household income
+- `pers_emerg_shelt`: Number of persons living in emergency or homeless shelters
+- `pers_homeless`: Number of persons who are homeless
+- `police_per_pop`: Number of police per 100K population
+- `racial_match`: Racial match of police force to population
+- `pop_density`: Population density
+- `pct_use_pub_trans`: % of population who use public transportation
+
+Outcome Variables:
+
+- `violent_per_pop`: Number of violent crimes per 100K population
+- `non_viol_per_pop`: Number of nonviolent crimes per 100K population
+
+
+
+### Read and Check Data
+
+Here, we read in and check the data.
+
+```{r, message = FALSE, warning = FALSE}
+# Read in the data
+crime_data <- read_csv("../data/community_crime_subset.csv")
+
+# Check the data
+skim_without_charts(crime_data)
+```
+
+Note that columns on police resources and the police force's racial match with their community are mostly missing, so we will remove them from the data for the sake of this lab. 
+To make things simple, we'll also drop any communities that are missing any key features.
+
+```{r}
+crime_data <- crime_data %>% 
+  select(-police_per_pop, -racial_match) %>%
+  na.omit()
+```
+
+Finally, as is standard practice, we'll set aside some data for a test set.
+
+```{r}
+set.seed(2565)
+crime_train <- crime_data %>% sample_frac(.75)
+crime_test <- crime_data %>% setdiff(crime_train)
+```
+
+
+
+## Basics of Fitting a Random Forest
+
+For this lab, we will use the `ranger` library to fit random forests. 
+The syntax for ranger should be somewhat familiar given what we've seen with linear models `lm()` and regularized models `glmnet()`. 
+The function we use is `ranger` which takes some familiar arguments including 
+
+- `formula` (e.g., `non_viol_per_pop ~ pct_urban + med_income`)
+- `data`
+
+In addition, it also takes arguments specific to random forests including two important tuning variables:
+
+- `num.trees` the number of trees to fit in the forest; the default is 500.
+- `mtry` the number of variables to possibly split at each node; default is the square root of the number of predictors.
+
+
+### First Random Forest
+
+For our first random forest, we won't worry about training or testing, but just the syntax. 
+Below, we fit a random forest where the nonviolent crime rate (`non_viol_per_pop`) is the outcome. 
+The model uses six predictors:
+
+- `med_income`: Median per capita income
+- `pct_pub_asst`: % of population receiving public assistance (e.g., TANF, SNAP)
+- `rent_qrange`: IQR of rent
+- `pers_homeless`: Number of persons who are homeless
+- `pct_unemploy`: % of adult population unemployed
+- `pct_use_pub_trans`: % of population who use public transportation
+
+The data used to train this model is the 75% of the data we set as the training set `crime_train`.
+
+```{r}
+rf_nonviolent <- ranger(formula = non_viol_per_pop ~ med_income + 
+                                                     pct_pub_asst + 
+                                                     rent_qrange + 
+                                                     pers_homeless +
+                                                     pct_unemploy + 
+                                                     pct_use_pub_trans,
+                        data = crime_train, 
+                        importance = "impurity")
+rf_nonviolent
+```
+
+Above, `rf_nonviolent` is a `ranger` object that contains a lot of information about the model we just fit. 
+For instance, we see that the random forest `rf_nonviolent` was trained on 500 bootstrap samples, and we used six features. 
+At each split point, the algorithm considered two possible variables (`Mtry`).
+
+The out-of-bag (OOB) mean squared error (MSE) is `r round(rf_nonviolent$prediction.error, 2)` (RMSE = `r round(sqrt(rf_nonviolent$prediction.error), 2)`). 
+
+
+### Exploring the Model
+
+Two questions we may wish to answer are which variables are important, and how important they are to the model. 
+We can extract this information from the `ranger` object directly, as it contains an attribute called `variable.importance`.
+
+```{r}
+imp <- tibble(var = names(rf_nonviolent$variable.importance), 
+              importance = unlist(rf_nonviolent$variable.importance))
+```
+
+There are a few ways we might want to display variable importance, including
+
+- raw sum of squares 
+- relative to the maximum importance
+
+These are shown below. 
+The second column shows the raw variable importance measure. 
+The third column shows the relative variable importance measure, which may be a little easier to interpret.
+```{r}
+imp %>% 
+  mutate(relative_importance = importance/max(importance)) %>%
+  arrange(desc(importance))
+```
+
+An alternative to tabular and numerical summaries of importance is to plot variable importance, which we can do easily with the `vip` function:
+```{r}
+vip(rf_nonviolent)
+```
+
+Next, it is possible to explore marginal relationships between a single variable and the nonviolent crime rates according to the model. 
+For that, we can use the `partial()` and `plotPartial()` functions:
+```{r}
+# Partial dependence plot for median income
+rf_nonviolent %>%
+  pdp::partial(., pred.var = "med_income") %>%
+  plotPartial(ylab = "Nonviolent Crime", xlab = "Median Income") 
+
+# Partial dependence plot for unemployment rate
+rf_nonviolent %>%
+  pdp::partial(., pred.var = "pct_unemploy") %>%
+  plotPartial(ylab = "Nonviolent Crime", xlab = "Unemployment Rate") 
+```
+
+Finally, we can examine the MSE and RMSE on the test set.
+Note that both of these are larger than the OOB error above.
+```{r}
+pred_values <- predict(rf_nonviolent, crime_test)$predictions
+test_mse <- mean((crime_test$non_viol_per_pop - pred_values)^2)
+test_mse
+sqrt(test_mse)
+```
+
+
+
+## Tuning Random Forests
+
+While the example above is useful to get a handle on syntax, typically random forests are fit using all available predictors, rather than just a few. 
+In fact, that is one of the benefits of random forests, they will still run even if there are large number of predictors.
+However, as we use more predictors, it is important that we actually tune the model, which we did not do above.
+
+There are a few key tuning variables with random forests, including 
+
+- the number of variables considered at each split (`mtry`),  
+- the number of trees (`num.trees`), 
+- the maximum depth of the trees (`max.depth`), and
+- the minimum node size (`min.node.size`)
+
+Here we will introduce how we can use cross-validation to tune the `mtry` parameter.
+To do so, we can use the following helper functions for training and testing models:
+```{r}
+# Function for fitting random forests
+fit_rf <- function(resample_obj, outcome, 
+                   exclude_vars = c("communityname", "state"), 
+                   importance = "impurity"){
+  
+  # Sanitize data input
+  data <- as_tibble(resample_obj) %>% select(-all_of(exclude_vars))
+  
+  # Set up model formula
+  fmla <- paste0(outcome, " ~ .")
+  
+  # Run the model
+  mod_out <- ranger(formula = fmla,
+                data = data, 
+                importance = importance)
+  
+  # Return the model
+  return(mod_out)
+  
+}
+
+# fit_rf(crime_train, "non_viol_per_pop", c("communityname", "state", "violent_per_pop"))
+
+# Function for getting test error
+mse_rf <- function(rf, resample_test, outcome){
+  
+  # Sanitize test data
+  data <-  as_tibble(resample_test)
+  
+  # Get predicted outcomes on test data
+  pred_values <- predict(rf, data)$predictions
+  
+  # Get the actual outcomes on the test data
+  y <- data[[outcome]] 
+  
+  # Compute the test MSE
+  test_mse <- mean((y - pred_values)^2)
+  
+  # Return the test MSE
+  return(test_mse)
+  
+}
+```
+
+The following code chunk uses 5-fold cross validation to tune `mtry` values from 2 to 20. 
+```{r}
+# Fold the training data
+crime_cv <- crime_train %>%
+  crossv_kfold(5, id = "fold")
+
+rf_mtry_cv <- crime_cv %>%
+  crossing(mtry = 2:20) %>% # cross folds with mtry values
+  mutate(rf_fit = map(train, fit_rf, outcome = "non_viol_per_pop",  exclude_vars = c("communityname", "state", "violent_per_pop")), # rit RFs
+         fold_error = map2(rf_fit, test, mse_rf, outcome = "non_viol_per_pop")) %>% # get test MSEs by fold
+  group_by(mtry) %>% 
+  summarize(mse = mean(unlist(fold_error))) %>%
+  arrange(mse)
+```
+
+There are two ways to examine the results of the cross validation code above. The first is numerically. 
+Below, we show the cross validation error for each value of `mtry` shown both on the scale of MSE and $R^2$
+```{r}
+rf_mtry_cv %>%
+  mutate(R2 = (var(crime_test$non_viol_per_pop) - mse)/var(crime_test$non_viol_per_pop))
+```
+
+Alternatively, we can plot the cross validation error as a function of `mtry`:
+```{r}
+ggplot(rf_mtry_cv) + 
+  geom_line(aes(mtry, sqrt(mse))) + 
+  labs(x = "Mtry", y = "RMSE") +
+  theme_bw()
+```
+
+Note that in both the plot and table above, there are not substantial differences in RMSE or MSE among the values of `mtry`. 
+One thing this may suggest is that we ought to consider the other tuning variables.
+
+
+## Activities
+
+### Question 1: Tuning the number of trees
+
+The model in the example above didn't seem to get markedly better with different values of `mtry`. Try tuning the number of trees fit in the model. What do you find?
+
+```{r}
+# crime_cv %>% WHAT?
+```
+
+
+### Question 2: Tuning a regression-based random forest
+
+Tune a random forest model where `violent_per_pop` is the outcome. 
+Be sure to **exclude** `non_viol_per_pop` as a predictor. 
+Report the final values of the tuning parameters that you found to perform best and justify why you think this is the best model.
+This justification should probably involve some plots.
+Finally, examine the variable importance of your best model; what predictors are particularly useful, and which are less useful?
+
+```{r}
+# YOUR SOLUTION HERE!
+```
+
+
+### Question 3: Tuning for a classification problem
+
+One way to distinguish between "high" and "low" crime areas is that high crime areas have over 500 violent crimes per 100,000 people. 
+Mutate the data to create a `high_crime` variable that is 1 if the area is considered "high crime" and 0 otherwise. 
+Tune a random forest to predict whether an area will be "high crime." 
+Be sure to **exclude** `violent_per_pop` and `non_viol_per_pop` as predictors.
+What variables did you tune, and what was your optimal model? Why? What variables were more or less important in this model? How do these results compare to Question 2?
+
+```{r}
+# YOUR SOLUTION HERE!
+```
+
+
+
+
